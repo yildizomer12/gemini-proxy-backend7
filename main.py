@@ -102,70 +102,11 @@ def convert_messages(messages):
         for msg in messages
     ]
 
-def extract_json_objects(text):
-    """Extract JSON objects from text, handling multiple objects and arrays"""
-    objects = []
-    text = text.strip()
-    
-    # Handle single JSON object
-    if text.startswith('{') and text.endswith('}'):
-        try:
-            obj = json.loads(text)
-            objects.append(obj)
-            return objects
-        except:
-            pass
-    
-    # Handle JSON array
-    if text.startswith('[') and text.endswith(']'):
-        try:
-            array = json.loads(text)
-            if isinstance(array, list):
-                objects.extend(array)
-            else:
-                objects.append(array)
-            return objects
-        except:
-            pass
-    
-    # Handle multiple JSON objects separated by newlines
-    lines = text.split('\n')
-    current_obj = ""
-    brace_count = 0
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        current_obj += line
-        
-        # Count braces to detect complete JSON objects
-        for char in line:
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                
-        # When brace count reaches 0, we have a complete object
-        if brace_count == 0 and current_obj:
-            try:
-                obj = json.loads(current_obj)
-                objects.append(obj)
-                current_obj = ""
-            except:
-                # If parsing fails, reset and continue
-                current_obj = ""
-                brace_count = 0
-    
-    return objects
-
 async def real_gemini_stream(api_key: str, messages, generation_config, model: str):
-    """BrokenPipeError'a karşı korumalı Gemini stream işlemcisi"""
+    """Basitleştirilmiş ve kararlı Gemini stream işlemcisi"""
     
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_time = int(time.time())
-    client_disconnected = False
     
     try:
         # Initial chunk with role
@@ -183,7 +124,7 @@ async def real_gemini_stream(api_key: str, messages, generation_config, model: s
         yield f"data: {json.dumps(initial_chunk)}\n\n"
         
         async with httpx.AsyncClient(timeout=120) as client:
-            print(f"[DEBUG] Sending request to Gemini API with model: {model}")
+            print(f"[DEBUG] Starting Gemini API request for model: {model}")
             
             async with client.stream(
                 'POST',
@@ -200,210 +141,92 @@ async def real_gemini_stream(api_key: str, messages, generation_config, model: s
                 
                 if response.status_code != 200:
                     error_text = await response.aread()
-                    print(f"[ERROR] Gemini API error - Status: {response.status_code}, Response: {error_text.decode()}")
+                    print(f"[ERROR] Gemini API error: {response.status_code}")
                     
-                    if not client_disconnected:
-                        try:
-                            error_chunk = {
-                                'id': chunk_id,
-                                'object': 'chat.completion.chunk',
-                                'created': created_time,
-                                'model': model,
-                                'choices': [{
-                                    'index': 0,
-                                    'delta': {'content': f"API Error: {response.status_code}"},
-                                    'finish_reason': 'error'
-                                }]
-                            }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                        except GeneratorExit:
-                            client_disconnected = True
-                            return
+                    error_chunk = {
+                        'id': chunk_id,
+                        'object': 'chat.completion.chunk',
+                        'created': created_time,
+                        'model': model,
+                        'choices': [{
+                            'index': 0,
+                            'delta': {'content': f"API Error: {response.status_code}"},
+                            'finish_reason': 'error'
+                        }]
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
                     return
                 
-                # Buffer for accumulating response data
-                response_buffer = ""
-                last_sent_time = time.time()
-                
-                async for chunk in response.aiter_bytes():
-                    # Early exit if client disconnected
-                    if client_disconnected:
-                        print("[DEBUG] Client disconnected, stopping stream")
-                        return
-                        
-                    try:
-                        # Decode chunk and add to buffer
-                        chunk_text = chunk.decode('utf-8')
-                        response_buffer += chunk_text
-                        
-                        print(f"[DEBUG] Buffer content: {response_buffer[:200]}...")  # First 200 chars
-                        
-                        # Try to extract complete JSON objects from buffer
-                        json_objects = extract_json_objects(response_buffer)
-                        
-                        if json_objects:
-                            # Process each JSON object
-                            for json_obj in json_objects:
-                                if client_disconnected:
-                                    return
-                                    
-                                if 'candidates' in json_obj:
-                                    candidate = json_obj['candidates'][0]
-                                    
-                                    if 'content' in candidate and 'parts' in candidate['content']:
-                                        for part in candidate['content']['parts']:
-                                            if 'text' in part and part['text'].strip():
-                                                content = part['text']
-                                                
-                                                try:
-                                                    # Create OpenAI format chunk
-                                                    openai_chunk = {
-                                                        'id': chunk_id,
-                                                        'object': 'chat.completion.chunk',
-                                                        'created': created_time,
-                                                        'model': model,
-                                                        'choices': [{
-                                                            'index': 0,
-                                                            'delta': {'content': content},
-                                                            'finish_reason': None
-                                                        }]
-                                                    }
-                                                    
-                                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
-                                                    last_sent_time = time.time()
-                                                    print(f"[DEBUG] Sent content chunk: {content[:50]}...")
-                                                except GeneratorExit:
-                                                    client_disconnected = True
-                                                    print("[DEBUG] Client disconnected during content sending")
-                                                    return
-                                    
-                                    # Check for finish reason
-                                    if candidate.get('finishReason') == 'STOP':
-                                        if not client_disconnected:
-                                            try:
-                                                final_chunk = {
-                                                    'id': chunk_id,
-                                                    'object': 'chat.completion.chunk',
-                                                    'created': created_time,
-                                                    'model': model,
-                                                    'choices': [{
-                                                        'index': 0,
-                                                        'delta': {},
-                                                        'finish_reason': 'stop'
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(final_chunk)}\n\n"
-                                                yield "data: [DONE]\n\n"
-                                                print("[DEBUG] Stream completed normally")
-                                            except GeneratorExit:
-                                                client_disconnected = True
-                                                print("[DEBUG] Client disconnected during completion")
-                                        return
-                            
-                            # Clear buffer after successful processing
-                            response_buffer = ""
-                        
-                        # Send keep-alive if no data sent for 10 seconds
-                        current_time = time.time()
-                        if current_time - last_sent_time >= 10 and not client_disconnected:
-                            try:
-                                keep_alive_chunk = {
-                                    "id": chunk_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": ""},
-                                        "finish_reason": None
-                                    }]
-                                }
-                                yield f"data: {json.dumps(keep_alive_chunk)}\n\n"
-                                last_sent_time = current_time
-                                print("[DEBUG] Sent keep-alive chunk")
-                            except GeneratorExit:
-                                client_disconnected = True
-                                print("[DEBUG] Client disconnected during keep-alive")
-                                return
+                # Simplified line-by-line processing
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
                     
-                    except UnicodeDecodeError:
-                        print("[WARN] Unicode decode error, skipping chunk")
-                        continue
-                    except GeneratorExit:
-                        client_disconnected = True
-                        print("[DEBUG] Client disconnected during processing")
-                        return
-                    except Exception as e:
-                        print(f"[ERROR] Chunk processing error: {e}")
-                        continue
-                
-                # Handle any remaining buffer content
-                if response_buffer.strip() and not client_disconnected:
-                    print(f"[DEBUG] Processing remaining buffer: {response_buffer}")
                     try:
-                        json_objects = extract_json_objects(response_buffer)
-                        for json_obj in json_objects:
-                            if client_disconnected:
-                                return
-                                
-                            if 'candidates' in json_obj:
-                                candidate = json_obj['candidates'][0]
+                        # Parse the JSON response from Gemini
+                        if line.startswith('[') or line.startswith('{'):
+                            json_data = json.loads(line)
+                            
+                            # Handle both single objects and arrays
+                            candidates_list = []
+                            if isinstance(json_data, list):
+                                for item in json_data:
+                                    if 'candidates' in item:
+                                        candidates_list.extend(item['candidates'])
+                            elif 'candidates' in json_data:
+                                candidates_list = json_data['candidates']
+                            
+                            # Process each candidate
+                            for candidate in candidates_list:
                                 if 'content' in candidate and 'parts' in candidate['content']:
                                     for part in candidate['content']['parts']:
                                         if 'text' in part and part['text'].strip():
                                             content = part['text']
-                                            try:
-                                                openai_chunk = {
-                                                    'id': chunk_id,
-                                                    'object': 'chat.completion.chunk',
-                                                    'created': created_time,
-                                                    'model': model,
-                                                    'choices': [{
-                                                        'index': 0,
-                                                        'delta': {'content': content},
-                                                        'finish_reason': None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(openai_chunk)}\n\n"
-                                            except GeneratorExit:
-                                                client_disconnected = True
-                                                return
+                                            
+                                            # Send content chunk
+                                            content_chunk = {
+                                                'id': chunk_id,
+                                                'object': 'chat.completion.chunk',
+                                                'created': created_time,
+                                                'model': model,
+                                                'choices': [{
+                                                    'index': 0,
+                                                    'delta': {'content': content},
+                                                    'finish_reason': None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(content_chunk)}\n\n"
+                                            print(f"[DEBUG] Sent: {content[:50]}...")
+                                
+                                # Check for completion
+                                if candidate.get('finishReason') == 'STOP':
+                                    print("[DEBUG] Stream completed")
+                                    final_chunk = {
+                                        'id': chunk_id,
+                                        'object': 'chat.completion.chunk',
+                                        'created': created_time,
+                                        'model': model,
+                                        'choices': [{
+                                            'index': 0,
+                                            'delta': {},
+                                            'finish_reason': 'stop'
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
+                    
+                    except json.JSONDecodeError:
+                        # Skip malformed JSON lines
+                        continue
                     except Exception as e:
-                        print(f"[ERROR] Final buffer processing error: {e}")
-    
-    except asyncio.CancelledError:
-        print("[INFO] Stream cancelled by client")
-        client_disconnected = True
-        return
-    except GeneratorExit:
-        print("[INFO] Client disconnected (GeneratorExit)")
-        client_disconnected = True
-        return
-    except Exception as e:
-        print(f"[ERROR] Stream error: {str(e)}")
-        if not client_disconnected:
-            try:
-                error_chunk = {
-                    'id': chunk_id,
-                    'object': 'chat.completion.chunk',
-                    'created': created_time,
-                    'model': model,
-                    'choices': [{
-                        'index': 0,
-                        'delta': {'content': f"Stream error: {str(e)}"},
-                        'finish_reason': 'error'
-                    }]
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-            except GeneratorExit:
-                client_disconnected = True
-                return
-    
-    finally:
-        # Ensure proper termination only if client is still connected
-        if not client_disconnected:
-            try:
+                        print(f"[ERROR] Line processing error: {e}")
+                        continue
+                
+                # Ensure completion
+                print("[DEBUG] Stream ended without explicit completion")
                 final_chunk = {
                     'id': chunk_id,
                     'object': 'chat.completion.chunk',
@@ -417,15 +240,36 @@ async def real_gemini_stream(api_key: str, messages, generation_config, model: s
                 }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-                print("[DEBUG] Stream terminated normally")
-            except GeneratorExit:
-                print("[DEBUG] Client disconnected during final cleanup")
-                pass
+    
+    except asyncio.CancelledError:
+        print("[INFO] Stream cancelled")
+        return
+    except GeneratorExit:
+        print("[INFO] Client disconnected")
+        return
+    except Exception as e:
+        print(f"[ERROR] Stream error: {str(e)}")
+        try:
+            error_chunk = {
+                'id': chunk_id,
+                'object': 'chat.completion.chunk',
+                'created': created_time,
+                'model': model,
+                'choices': [{
+                    'index': 0,
+                    'delta': {'content': f"Error: {str(e)}"},
+                    'finish_reason': 'error'
+                }]
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        except:
+            pass
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
     try:
-        print(f"[DEBUG] Received request: model={request.model}, stream={request.stream}, messages={len(request.messages)}")
+        print(f"[DEBUG] Request: model={request.model}, stream={request.stream}")
         
         gemini_messages = convert_messages(request.messages)
         generation_config = {"temperature": request.temperature}
@@ -433,49 +277,16 @@ async def chat_completions(request: ChatRequest):
             generation_config["max_output_tokens"] = request.max_tokens
         
         api_key = get_next_key()
-        print(f"[DEBUG] Using API key: {api_key[:10]}...")
         
         if request.stream:
-            async def safe_stream_wrapper():
-                """Stream wrapper with proper error handling"""
-                try:
-                    async for chunk in real_gemini_stream(api_key, gemini_messages, generation_config, request.model):
-                        yield chunk
-                except asyncio.CancelledError:
-                    print("[INFO] Stream cancelled in wrapper")
-                    return
-                except GeneratorExit:
-                    print("[INFO] Generator exit in wrapper")
-                    return
-                except Exception as e:
-                    print(f"[ERROR] Stream wrapper error: {str(e)}")
-                    # Send error chunk if possible
-                    try:
-                        error_chunk = {
-                            'id': f"chatcmpl-{uuid.uuid4().hex}",
-                            'object': 'chat.completion.chunk',
-                            'created': int(time.time()),
-                            'model': request.model,
-                            'choices': [{
-                                'index': 0,
-                                'delta': {'content': f"Error: {str(e)}"},
-                                'finish_reason': 'error'
-                            }]
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                    except:
-                        pass
-            
             return StreamingResponse(
-                safe_stream_wrapper(),
+                real_gemini_stream(api_key, gemini_messages, generation_config, request.model),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "Access-Control-Allow-Origin": "*",
-                    "Transfer-Encoding": "chunked",
                     "Content-Type": "text/event-stream"
                 }
             )
@@ -495,7 +306,6 @@ async def chat_completions(request: ChatRequest):
                 )
                 
                 if not response.is_success:
-                    print(f"[ERROR] Non-stream API error: {response.status_code} - {response.text}")
                     raise HTTPException(status_code=response.status_code, detail="Gemini API error")
                 
                 result = response.json()
@@ -522,7 +332,7 @@ async def chat_completions(request: ChatRequest):
                 }
                 
     except Exception as e:
-        print(f"[ERROR] Request processing error: {str(e)}")
+        print(f"[ERROR] Request error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
@@ -532,8 +342,7 @@ async def health():
         "timestamp": int(time.time()),
         "key_usage": sum(key_usage.values()),
         "total_keys": len(API_KEYS),
-        "current_key_index": current_key_index,
-        "stream_version": "v2_improved"
+        "stream_version": "v3_simplified"
     }
 
 @app.head("/health")
@@ -569,7 +378,7 @@ async def test_endpoint(request: Request):
 async def root():
     return {
         "message": "Gemini Proxy Server",
-        "version": "2.0",
+        "version": "3.0",
         "endpoints": ["/v1/chat/completions", "/health"],
         "status": "running"
     }

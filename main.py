@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
+from mangum import Mangum
 
 # FastAPI app
 app = FastAPI(title="Gemini Backend for Vercel - Real Stream")
@@ -375,50 +376,17 @@ async def health():
         "timestamp": int(time.time()),
         "key_usage": sum(key_usage.values()),
         "total_keys": len(API_KEYS),
-        "stream_version": "v4_final"
-    }
-
-@app.head("/health")
-async def head_health():
-    return {}
-
-@app.get("/debug")
-async def debug_info():
-    return {
-        "available_endpoints": [
-            {"path": "/", "methods": ["GET", "HEAD"]},
-            {"path": "/health", "methods": ["GET", "HEAD"]},
-            {"path": "/v1/chat/completions", "methods": ["POST", "OPTIONS"]},
-            {"path": "/debug", "methods": ["GET"]}
-        ],
-        "server_info": {
-            "python_version": "3.12",
-            "fastapi_running": True,
-            "vercel_deployment": True
-        }
-    }
-
-@app.api_route("/test", methods=["GET", "POST", "OPTIONS"])
-async def test_endpoint(request: Request):
-    return {
-        "method": request.method,
-        "url": str(request.url),
-        "headers": dict(request.headers),
-        "message": f"Test endpoint received {request.method} request"
+        "stream_version": "v5_mangum"
     }
 
 @app.get("/")
 async def root():
     return {
         "message": "Gemini Proxy Server",
-        "version": "4.0",
+        "version": "5.0",
         "endpoints": ["/v1/chat/completions", "/health"],
         "status": "running"
     }
-
-@app.head("/")
-async def head_root():
-    return {}
 
 @app.middleware("http")
 async def cors_handler(request, call_next):
@@ -432,5 +400,5 @@ async def cors_handler(request, call_next):
 async def options_handler():
     return {"message": "OK"}
 
-# Vercel için gerekli - FastAPI app'ini export et
-handler = app
+# Vercel için ASGI handler
+handler = Mangum(app)
